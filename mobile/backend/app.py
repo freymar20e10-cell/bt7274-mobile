@@ -32,7 +32,7 @@ SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 
-OPENROUTER_MODEL = "openrouter/owl-alpha"
+OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 ASSISTANT_NAME = "BT-7274"
 USER_NAME = "Piloto"
 
@@ -313,6 +313,42 @@ def chat():
     if session_id not in conversations:
         conversations[session_id] = []
 
+    # Detectar preguntas directas ANTES de mandar a la IA
+    msg_lower = message.lower().strip()
+
+    # CLIMA — responder directo con datos reales
+    if any(w in msg_lower for w in ["clima", "temperatura", "hace frío", "hace calor", "tiempo hace"]):
+        mem = _load_memory()
+        city = mem.get("ciudad", "Barrancabermeja")
+        try:
+            encoded = urllib.parse.quote(city)
+            url = f"https://wttr.in/{encoded}?format=j1"
+            req = urllib.request.Request(url, headers={"User-Agent": "BT-7274/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                wdata = json.loads(resp.read().decode("utf-8"))
+            current = wdata.get("current_condition", [{}])[0]
+            location = wdata.get("nearest_area", [{}])[0]
+            city_name = location.get("areaName", [{"value": city}])[0]["value"]
+            temp = current.get("temp_C", "?")
+            feels = current.get("FeelsLikeC", "?")
+            humidity = current.get("humidity", "?")
+            weather_resp = f"🌤️ En {city_name} hay {temp}°C (sensación {feels}°C), humedad {humidity}%."
+            conversations[session_id].append({"role": "user", "content": message})
+            conversations[session_id].append({"role": "assistant", "content": weather_resp})
+            return jsonify({"response": weather_resp, "actions": [], "spotify": None})
+        except Exception:
+            pass
+
+    # HORA — responder directo
+    if any(w in msg_lower for w in ["qué hora", "que hora", "hora es"]):
+        from datetime import timezone, timedelta
+        now = datetime.now(timezone(timedelta(hours=-5)))
+        time_resp = f"🕐 Son las {now.strftime('%I:%M %p')} en Colombia ({now.strftime('%A %d de %B')})."
+        conversations[session_id].append({"role": "user", "content": message})
+        conversations[session_id].append({"role": "assistant", "content": time_resp})
+        return jsonify({"response": time_resp, "actions": [], "spotify": None})
+
+    # Para todo lo demás — usar la IA
     conversations[session_id].append({"role": "user", "content": message})
     if len(conversations[session_id]) > 20:
         conversations[session_id] = conversations[session_id][-20:]
@@ -404,7 +440,7 @@ def text_to_speech():
     if not ELEVENLABS_API_KEY or not text:
         return jsonify({"error": "No disponible"}), 400
 
-    voice_id = "ErXwobaYiN019PkySvjV"
+    voice_id = "iP95p4xoKVk53GoZ742B"  # Carlos - español, serio, claro
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
     payload = json.dumps({
         "text": text,
