@@ -1,7 +1,7 @@
 """
 BT-7274 Mobile — Backend (Flask)
-Servidor ligero que se hostea gratis en Render/Railway.
-Funciona SIN tu PC: chat, voz, Spotify, notas, clima.
+Servidor que se hostea gratis en Render.
+Chat, voz, Spotify, notas, memoria, clima.
 """
 
 import os
@@ -13,13 +13,13 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder="../frontend", static_url_path="")
 CORS(app)
 
 # ═══════════════════════════════════════════
@@ -36,86 +36,243 @@ OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 ASSISTANT_NAME = "BT-7274"
 USER_NAME = "Piloto"
 
-# Memoria simple en archivo (en el servidor)
-MEMORY_FILE = Path("data/memory.json")
-NOTES_FILE = Path("data/notes.json")
-MEMORY_FILE.parent.mkdir(exist_ok=True)
+# Datos
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+MEMORY_FILE = DATA_DIR / "memory.json"
+NOTES_FILE = DATA_DIR / "notes.json"
 
-# Conversación por sesión
+# Conversaciones
 conversations = {}
 
-SYSTEM_PROMPT = f"""Eres {ASSISTANT_NAME}, un asistente de IA personal tipo JARVIS.
+# Spotify token cache
+_spotify_token = None
+_spotify_token_expires = 0
+
+
+# ═══════════════════════════════════════════
+# SYSTEM PROMPT
+# ═══════════════════════════════════════════
+
+def get_system_prompt():
+    memory = _load_memory()
+    mem_text = ""
+    if memory:
+        mem_text = "\n\nMEMORIA DEL USUARIO:\n" + "\n".join(f"- {k}: {v}" for k, v in memory.items())
+
+    return f"""Eres {ASSISTANT_NAME}, un asistente de IA personal tipo JARVIS.
 Tu piloto se llama {USER_NAME}. Eres leal, directo, eficiente y con personalidad.
 Hablas en español. Eres como el Titan BT-7274 de Titanfall: protector, confiable.
-Responde de forma concisa pero útil. Usa emojis ocasionalmente.
-Estás corriendo en modo móvil — no puedes controlar la PC del usuario ahora,
-pero puedes chatear, dar información, controlar Spotify, guardar notas y recordar cosas.
 
 REGLAS ESTRICTAS:
 - NUNCA muestres tu proceso de pensamiento ni razonamiento interno.
-- NUNCA escribas frases como "Let me think", "Okay, the user is asking", "First I should", "Wait", etc.
-- SOLO responde con la respuesta final directa al usuario.
-- Responde SIEMPRE en español.
+- NUNCA escribas en inglés ni frases como "Let me think", "Okay", "Wait", "First I should".
+- SOLO responde con la respuesta final directa en español.
 - Sé conciso: máximo 2-3 oraciones para preguntas simples.
+- Usa emojis ocasionalmente.
+
+CAPACIDADES EN MODO MÓVIL:
+- Puedes recordar cosas: si el usuario dice "recuerda que X", responde con [MEMORY:clave=valor]
+- Puedes reproducir música: si pide una canción, responde con [SPOTIFY:nombre de la canción]
+- Puedes abrir YouTube: responde con [YOUTUBE:lo que quiere ver]
+- Puedes abrir apps: responde con [OPEN_APP:nombre]
+- Para clima usa la ciudad guardada en memoria, o Barrancabermeja por defecto.
+- Para la hora, usa UTC-5 (Colombia).
+
+FORMATO ESPECIAL (usa estos tags cuando aplique):
+- [MEMORY:ciudad=Bogotá] → guarda en memoria
+- [SPOTIFY:Rara vez de Milo J] → reproduce en Spotify
+- [OPEN_SPOTIFY] → abre Spotify
+- [YOUTUBE:MrBeast último video] → busca en YouTube
+- [OPEN_APP:whatsapp] → abre WhatsApp
+- [OPEN_APP:camera] → abre la cámara
+- [OPEN_APP:instagram] → abre Instagram
+- [OPEN_APP:telegram] → abre Telegram
+- [OPEN_APP:tiktok] → abre TikTok
+- [WHATSAPP:número=mensaje] → abre WhatsApp con mensaje listo (ej: [WHATSAPP:573001234567=Hola qué tal])
+- Si el usuario no da número pero sí nombre, usa [WHATSAPP:nombre=mensaje]
+{mem_text}
 """
 
 
 # ═══════════════════════════════════════════
-# CHAT (OpenRouter)
+# UTILIDADES
 # ═══════════════════════════════════════════
 
+def _load_memory():
+    if not MEMORY_FILE.exists():
+        return {}
+    try:
+        return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_memory(mem):
+    MEMORY_FILE.write_text(json.dumps(mem, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_notes():
+    if not NOTES_FILE.exists():
+        return []
+    try:
+        return json.loads(NOTES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _save_notes(notes):
+    NOTES_FILE.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def filter_reasoning(text: str) -> str:
-    """Filtra el razonamiento interno del modelo y deja solo la respuesta final."""
-    # Si el modelo piensa en inglés pero responde en español, tomar solo la parte en español
+    """Filtra razonamiento interno del modelo."""
     lines = text.split("\n")
-    
-    # Detectar patrones de razonamiento
     reasoning_starts = ["okay,", "let me", "first,", "wait,", "so,", "looking at",
                        "the user", "i should", "i need to", "but wait", "hmm",
-                       "earlier,", "thus,", "response:", "so maybe:"]
-    
-    # Buscar dónde empieza la respuesta real
+                       "earlier,", "thus,", "response:", "so maybe:", "but since",
+                       "now,", "alright", "let's"]
+
     clean_lines = []
-    found_response = False
-    
     for line in lines:
         line_lower = line.strip().lower()
-        
-        # Si encontramos una línea que parece respuesta en español
-        if any(c in line for c in "áéíóúñ¿¡") and not line_lower.startswith(tuple(reasoning_starts)):
-            found_response = True
-        
-        # Si empieza con "Response:" tomar lo que sigue
-        if line_lower.startswith("response:"):
-            clean_lines.append(line[len("response:"):].strip().strip('"'))
-            found_response = True
-            continue
-            
-        if found_response and line.strip():
-            # Solo agregar líneas que parecen español / respuesta final
-            if not any(line_lower.startswith(r) for r in reasoning_starts):
+        if not any(line_lower.startswith(r) for r in reasoning_starts):
+            if line.strip():
                 clean_lines.append(line)
-    
-    if clean_lines:
-        result = "\n".join(clean_lines).strip()
-        # Limpiar comillas sobrantes
-        result = result.strip('"').strip("'")
-        if result:
-            return result
-    
-    # Si no pudo filtrar, devolver todo (mejor algo que nada)
-    return text
 
+    result = "\n".join(clean_lines).strip()
+    return result if result else text
+
+
+def process_tags(response: str) -> dict:
+    """Procesa tags especiales en la respuesta [MEMORY:x=y] [SPOTIFY:x] etc."""
+    actions = []
+
+    # MEMORY
+    import re
+    mem_matches = re.findall(r'\[MEMORY:(.+?)=(.+?)\]', response)
+    for key, value in mem_matches:
+        mem = _load_memory()
+        mem[key.strip()] = value.strip()
+        _save_memory(mem)
+        actions.append({"type": "memory", "key": key.strip(), "value": value.strip()})
+        response = response.replace(f"[MEMORY:{key}={value}]", "")
+
+    # SPOTIFY
+    spotify_matches = re.findall(r'\[SPOTIFY:(.+?)\]', response)
+    for query in spotify_matches:
+        actions.append({"type": "spotify_play", "query": query.strip()})
+        response = response.replace(f"[SPOTIFY:{query}]", "")
+
+    # OPEN SPOTIFY
+    if "[OPEN_SPOTIFY]" in response:
+        actions.append({"type": "spotify_open"})
+        response = response.replace("[OPEN_SPOTIFY]", "")
+
+    # YOUTUBE
+    youtube_matches = re.findall(r'\[YOUTUBE:(.+?)\]', response)
+    for query in youtube_matches:
+        actions.append({"type": "youtube_play", "query": query.strip()})
+        response = response.replace(f"[YOUTUBE:{query}]", "")
+
+    # OPEN APP
+    app_matches = re.findall(r'\[OPEN_APP:(.+?)\]', response)
+    for app_name in app_matches:
+        actions.append({"type": "open_app", "app": app_name.strip().lower()})
+        response = response.replace(f"[OPEN_APP:{app_name}]", "")
+
+    # WHATSAPP MESSAGE
+    wa_matches = re.findall(r'\[WHATSAPP:(.+?)=(.+?)\]', response)
+    for number_or_name, message in wa_matches:
+        actions.append({"type": "whatsapp", "to": number_or_name.strip(), "message": message.strip()})
+        response = response.replace(f"[WHATSAPP:{number_or_name}={message}]", "")
+
+    return {"response": response.strip(), "actions": actions}
+
+
+# ═══════════════════════════════════════════
+# SPOTIFY API (reproducir directo)
+# ═══════════════════════════════════════════
+
+def _get_spotify_token() -> str:
+    """Obtiene token de Spotify usando Client Credentials."""
+    global _spotify_token, _spotify_token_expires
+
+    if _spotify_token and time.time() < _spotify_token_expires:
+        return _spotify_token
+
+    url = "https://accounts.spotify.com/api/token"
+    data = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": SPOTIFY_CLIENT_ID,
+        "client_secret": SPOTIFY_CLIENT_SECRET,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            _spotify_token = result.get("access_token", "")
+            _spotify_token_expires = time.time() + result.get("expires_in", 3600) - 60
+            return _spotify_token
+    except Exception:
+        return ""
+
+
+def spotify_search(query: str) -> dict:
+    """Busca una canción en Spotify y devuelve el URI."""
+    token = _get_spotify_token()
+    if not token:
+        return {"error": "No token"}
+
+    # Separar artista si dice "X de Y"
+    search_query = query
+    for sep in [" de ", " por ", " by "]:
+        if sep in query.lower():
+            parts = query.lower().split(sep, 1)
+            search_query = f"track:{parts[0].strip()} artist:{parts[1].strip()}"
+            break
+
+    encoded = urllib.parse.quote(search_query)
+    url = f"https://api.spotify.com/v1/search?q={encoded}&type=track&limit=1"
+
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}"
+    })
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            tracks = data.get("tracks", {}).get("items", [])
+            if tracks:
+                track = tracks[0]
+                return {
+                    "name": track["name"],
+                    "artist": track["artists"][0]["name"],
+                    "uri": track["uri"],
+                    "url": track["external_urls"]["spotify"],
+                }
+    except Exception as e:
+        return {"error": str(e)}
+
+    return {"error": "No encontrado"}
+
+
+# ═══════════════════════════════════════════
+# OPENROUTER
+# ═══════════════════════════════════════════
 
 def call_openrouter(messages: list) -> str:
     url = "https://openrouter.ai/api/v1/chat/completions"
-    formatted = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+    formatted = [{"role": "system", "content": get_system_prompt()}] + messages
 
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": formatted,
         "temperature": 0.7,
-        "max_tokens": 1024,
+        "max_tokens": 512,
     }
 
     data = json.dumps(payload).encode("utf-8")
@@ -138,10 +295,14 @@ def call_openrouter(messages: list) -> str:
             if attempt < 2:
                 time.sleep(2)
             else:
-                return f"Error: {e}"
+                return f"Error de conexión. Intenta de nuevo."
 
-    return "No pude obtener respuesta. Intenta de nuevo."
+    return "No pude responder. Intenta de nuevo."
 
+
+# ═══════════════════════════════════════════
+# ENDPOINTS
+# ═══════════════════════════════════════════
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
@@ -153,33 +314,53 @@ def chat():
         conversations[session_id] = []
 
     conversations[session_id].append({"role": "user", "content": message})
-
-    # Limitar historial
     if len(conversations[session_id]) > 20:
         conversations[session_id] = conversations[session_id][-20:]
 
     response = call_openrouter(conversations[session_id])
-    
-    # Filtrar razonamiento interno del modelo
     response = filter_reasoning(response)
-    
-    conversations[session_id].append({"role": "assistant", "content": response})
 
-    return jsonify({"response": response})
+    # Procesar tags especiales
+    processed = process_tags(response)
+    clean_response = processed["response"]
+    actions = processed["actions"]
+
+    conversations[session_id].append({"role": "assistant", "content": clean_response})
+
+    # Procesar acciones de Spotify
+    spotify_data = None
+    for action in actions:
+        if action["type"] == "spotify_play":
+            spotify_data = spotify_search(action["query"])
+        elif action["type"] == "spotify_open":
+            spotify_data = {"open": True}
+
+    return jsonify({
+        "response": clean_response,
+        "actions": actions,
+        "spotify": spotify_data,
+    })
 
 
-# ═══════════════════════════════════════════
-# CLIMA
-# ═══════════════════════════════════════════
+@app.route("/api/spotify/search", methods=["GET"])
+def api_spotify_search():
+    query = request.args.get("q", "")
+    if not query:
+        return jsonify({"error": "No query"}), 400
+    result = spotify_search(query)
+    return jsonify(result)
+
 
 @app.route("/api/weather", methods=["GET"])
 def weather():
-    city = request.args.get("city", "Barrancabermeja")
-    try:
-        city_encoded = urllib.parse.quote(city)
-        url = f"https://wttr.in/{city_encoded}?format=j1"
-        req = urllib.request.Request(url, headers={"User-Agent": "BT-7274/1.0"})
+    mem = _load_memory()
+    default_city = mem.get("ciudad", "Barrancabermeja")
+    city = request.args.get("city", default_city)
 
+    try:
+        encoded = urllib.parse.quote(city)
+        url = f"https://wttr.in/{encoded}?format=j1"
+        req = urllib.request.Request(url, headers={"User-Agent": "BT-7274/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
@@ -192,27 +373,9 @@ def weather():
             "feels_like": current.get("FeelsLikeC", "?"),
             "humidity": current.get("humidity", "?"),
             "wind": current.get("windspeedKmph", "?"),
-            "description": current.get("weatherDesc", [{"value": ""}])[0]["value"],
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-# ═══════════════════════════════════════════
-# NOTAS
-# ═══════════════════════════════════════════
-
-def _load_notes():
-    if not NOTES_FILE.exists():
-        return []
-    try:
-        return json.loads(NOTES_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-
-def _save_notes(notes):
-    NOTES_FILE.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 @app.route("/api/notes", methods=["GET"])
@@ -224,39 +387,9 @@ def get_notes():
 def add_note():
     data = request.json
     notes = _load_notes()
-    notes.append({
-        "content": data.get("content", ""),
-        "created_at": datetime.now().isoformat(),
-    })
+    notes.append({"content": data.get("content", ""), "created_at": datetime.now().isoformat()})
     _save_notes(notes)
-    return jsonify({"ok": True, "count": len(notes)})
-
-
-@app.route("/api/notes/<int:index>", methods=["DELETE"])
-def delete_note(index):
-    notes = _load_notes()
-    if 0 <= index < len(notes):
-        notes.pop(index)
-        _save_notes(notes)
-        return jsonify({"ok": True})
-    return jsonify({"error": "Nota no encontrada"}), 404
-
-
-# ═══════════════════════════════════════════
-# MEMORIA
-# ═══════════════════════════════════════════
-
-def _load_memory():
-    if not MEMORY_FILE.exists():
-        return {}
-    try:
-        return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _save_memory(mem):
-    MEMORY_FILE.write_text(json.dumps(mem, ensure_ascii=False, indent=2), encoding="utf-8")
+    return jsonify({"ok": True})
 
 
 @app.route("/api/memory", methods=["GET"])
@@ -264,46 +397,17 @@ def get_memory():
     return jsonify(_load_memory())
 
 
-@app.route("/api/memory", methods=["POST"])
-def save_memory():
-    data = request.json
-    mem = _load_memory()
-    mem[data.get("key", "")] = data.get("value", "")
-    _save_memory(mem)
-    return jsonify({"ok": True})
-
-
-# ═══════════════════════════════════════════
-# SPOTIFY
-# ═══════════════════════════════════════════
-
-@app.route("/api/spotify/search", methods=["GET"])
-def spotify_search():
-    query = request.args.get("q", "")
-    # Usar Spotify search URI que abre la app del celular
-    return jsonify({
-        "uri": f"spotify:search:{query}",
-        "web_url": f"https://open.spotify.com/search/{urllib.parse.quote(query)}"
-    })
-
-
-# ═══════════════════════════════════════════
-# TTS (ElevenLabs)
-# ═══════════════════════════════════════════
-
 @app.route("/api/tts", methods=["POST"])
 def text_to_speech():
     data = request.json
-    text = data.get("text", "")
-
+    text = data.get("text", "")[:250]
     if not ELEVENLABS_API_KEY or not text:
-        return jsonify({"error": "No API key or empty text"}), 400
+        return jsonify({"error": "No disponible"}), 400
 
-    voice_id = "ErXwobaYiN019PkySvjV"  # Antoni
+    voice_id = "ErXwobaYiN019PkySvjV"
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
-
     payload = json.dumps({
-        "text": text[:250],
+        "text": text,
         "model_id": "eleven_flash_v2_5",
         "voice_settings": {"stability": 0.45, "similarity_boost": 0.75, "style": 0.2}
     }).encode("utf-8")
@@ -316,43 +420,21 @@ def text_to_speech():
 
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            audio = resp.read()
-        from flask import Response
-        return Response(audio, mimetype="audio/mpeg")
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            return Response(resp.read(), mimetype="audio/mpeg")
+    except Exception:
+        return jsonify({"error": "TTS failed"}), 500
 
-
-# ═══════════════════════════════════════════
-# INFO
-# ═══════════════════════════════════════════
 
 @app.route("/api/status", methods=["GET"])
 def status():
-    return jsonify({
-        "name": ASSISTANT_NAME,
-        "status": "online",
-        "mode": "mobile",
-        "time": datetime.now().isoformat(),
-    })
+    return jsonify({"name": ASSISTANT_NAME, "status": "online", "mode": "mobile"})
 
 
 @app.route("/", methods=["GET"])
 def index():
-    return app.send_static_file("index.html")
-
-
-# Servir archivos estáticos del frontend
-app.static_folder = os.path.join(os.path.dirname(__file__), "..", "frontend")
-app.static_url_path = ""
+    return send_from_directory(app.static_folder, "index.html")
 
 
 if __name__ == "__main__":
-    # Redirigir static folder
-    import shutil
-    frontend_dir = Path(__file__).parent.parent / "frontend"
-    if frontend_dir.exists():
-        app.static_folder = str(frontend_dir)
-
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)

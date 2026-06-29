@@ -136,34 +136,33 @@
         const API_URL = 'https://bt7274-mobile.onrender.com';
         const sessionId = 'mobile-' + Date.now();
 
-        // ═══ TTS (Voz del navegador — gratis, sin API) ═══
-        function speakText(text) {
-            if ('speechSynthesis' in window) {
-                // Limpiar emojis y símbolos
-                const clean = text.replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{2600}-\u{2B55}\u{200d}\u{23cf}\u{23e9}\u{231a}\u{fe0f}═╔╗╚╝╠╣║✅❌⚠️📋📅⏰🔍📰🌤️🕐📝🎵💬🧠📊🔴🟡🟢⬜●○🎤🔇⌨️🫡💡📖📚🌐🎬⏸️▶️⏮⏭🔊🔀🔁💿📁📄📦✏️🗑️🗂️📂]/gu, '');
-                
-                if (!clean.trim()) return;
-                
-                window.speechSynthesis.cancel();
-                const utter = new SpeechSynthesisUtterance(clean.slice(0, 300));
-                utter.lang = 'es-ES';
-                utter.rate = 1.05;
-                utter.pitch = 0.9;
-                
-                // Intentar usar una voz masculina en español
-                const voices = window.speechSynthesis.getVoices();
-                const esVoice = voices.find(v => v.lang.startsWith('es') && v.name.toLowerCase().includes('male')) 
-                    || voices.find(v => v.lang.startsWith('es'));
-                if (esVoice) utter.voice = esVoice;
-                
-                window.speechSynthesis.speak(utter);
-            }
-        }
+        // ═══ TTS (ElevenLabs via backend — buena calidad) ═══
+        async function speakText(text) {
+            // Limpiar texto
+            const clean = text.replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{2600}-\u{2B55}\u{200d}\u{fe0f}═╔╗╚╝╠╣║✅❌⚠️📋📅⏰🔍📰🌤️🕐📝🎵💬🧠📊●○🎤🔇⌨️💡📖📚🌐🎬⏸️▶️⏮⏭🔊🔀🔁💿📁📄📦✏️🗑️🗂️📂🔴🟡🟢⬜🫡]/gu, '').trim();
+            if (!clean || clean.length < 3) return;
 
-        // Cargar voces
-        if ('speechSynthesis' in window) {
-            speechSynthesis.getVoices();
-            speechSynthesis.onvoiceschanged = () => speechSynthesis.getVoices();
+            try {
+                const res = await fetch(`${API_URL}/api/tts`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: clean.slice(0, 200) })
+                });
+                if (res.ok) {
+                    const blob = await res.blob();
+                    const audio = new Audio(URL.createObjectURL(blob));
+                    audio.play();
+                }
+            } catch (e) {
+                // Fallback: voz del navegador
+                if ('speechSynthesis' in window) {
+                    const utter = new SpeechSynthesisUtterance(clean.slice(0, 200));
+                    utter.lang = 'es-ES';
+                    utter.rate = 1.05;
+                    utter.pitch = 0.9;
+                    speechSynthesis.speak(utter);
+                }
+            }
         }
 
         // ═══ CHAT ═══
@@ -190,13 +189,21 @@
                 addMsg('bot', data.response);
                 speakText(data.response);
 
-                // Detectar si BT menciona Spotify
-                if (data.response.toLowerCase().includes('spotify')) {
-                    detectSpotifyAction(data.response);
+                // Ejecutar acciones que devuelve el backend
+                if (data.actions) {
+                    data.actions.forEach(action => executeAction(action, data));
+                }
+
+                // Spotify directo si hay datos
+                if (data.spotify && data.spotify.url) {
+                    // Intentar abrir en app, fallback a web
+                    window.location.href = data.spotify.uri || data.spotify.url;
+                } else if (data.spotify && data.spotify.open) {
+                    window.location.href = 'spotify://';
                 }
             } catch (e) {
                 removeTyping();
-                addMsg('bot', '❌ Sin conexión. Espera 30 segundos (el servidor se está despertando) e intenta de nuevo.');
+                addMsg('bot', '❌ Sin conexión. Espera 30 seg (servidor despertando) e intenta de nuevo.');
             }
         }
 
@@ -230,24 +237,87 @@
             m.scrollTop = m.scrollHeight;
         }
 
-        // ═══ SPOTIFY (Deep Links para Android) ═══
-        function openSpotify() {
-            window.location.href = 'spotify://';
-        }
-
-        function detectSpotifyAction(text) {
-            const lower = text.toLowerCase();
-            // Detectar si menciona reproducir algo
-            const match = text.match(/[""\"](.*?)[""\"]/);
-            if (match && (lower.includes('reproduciendo') || lower.includes('poniendo'))) {
-                const query = match[1];
-                // Abrir búsqueda en Spotify app
-                window.location.href = `spotify:search:${encodeURIComponent(query)}`;
+        // ═══ ACCIONES (Deep Links Android) ═══
+        function executeAction(action, data) {
+            switch (action.type) {
+                case 'spotify_play':
+                    if (data.spotify && data.spotify.uri) {
+                        window.location.href = data.spotify.uri;
+                    } else if (data.spotify && data.spotify.url) {
+                        window.location.href = data.spotify.url;
+                    }
+                    break;
+                case 'spotify_open':
+                    window.location.href = 'spotify://';
+                    break;
+                case 'youtube_play':
+                    // Abrir YouTube con la búsqueda (se reproduce el primer resultado)
+                    window.location.href = `vnd.youtube://results?search_query=${encodeURIComponent(action.query)}`;
+                    // Fallback si no abre la app
+                    setTimeout(() => {
+                        window.location.href = `https://www.youtube.com/results?search_query=${encodeURIComponent(action.query)}`;
+                    }, 1500);
+                    break;
+                case 'youtube_open':
+                    window.location.href = 'vnd.youtube://';
+                    break;
+                case 'open_app':
+                    openAndroidApp(action.app);
+                    break;
+                case 'whatsapp':
+                    sendWhatsApp(action.to, action.message);
+                    break;
+                case 'memory':
+                    break;
             }
         }
 
-        function playOnSpotify(query) {
-            window.location.href = `spotify:search:${encodeURIComponent(query)}`;
+        function sendWhatsApp(to, message) {
+            // Si es un número (solo dígitos), usar wa.me
+            const cleanNumber = to.replace(/[^0-9+]/g, '');
+            if (cleanNumber.length >= 7) {
+                // Número de teléfono
+                const num = cleanNumber.startsWith('+') ? cleanNumber.substring(1) : cleanNumber;
+                window.location.href = `https://wa.me/${num}?text=${encodeURIComponent(message)}`;
+            } else {
+                // Es un nombre — abrir WhatsApp con el texto en el buscador
+                window.location.href = `whatsapp://send?text=${encodeURIComponent(message)}`;
+            }
+        }
+
+        function openAndroidApp(appName) {
+            const deepLinks = {
+                'spotify': 'spotify://',
+                'youtube': 'https://www.youtube.com',
+                'whatsapp': 'whatsapp://',
+                'instagram': 'instagram://',
+                'telegram': 'tg://',
+                'twitter': 'twitter://',
+                'x': 'twitter://',
+                'tiktok': 'snssdk1233://',
+                'facebook': 'fb://',
+                'discord': 'discord://',
+                'camera': 'intent://camera#Intent;action=android.media.action.STILL_IMAGE_CAMERA;end',
+                'maps': 'geo:0,0',
+                'google maps': 'geo:0,0',
+                'chrome': 'googlechrome://',
+                'gmail': 'googlegmail://',
+                'calendar': 'content://com.android.calendar',
+                'clock': 'android.intent.action.SET_ALARM',
+                'settings': 'android.settings.SETTINGS',
+                'calculator': 'intent://calculator#Intent;end',
+                'phone': 'tel:',
+                'contacts': 'content://contacts/people/',
+            };
+
+            const link = deepLinks[appName.toLowerCase()];
+            if (link) {
+                window.location.href = link;
+            }
+        }
+
+        function openSpotify() {
+            window.location.href = 'spotify://';
         }
 
         // ═══ VOICE (Web Speech API — reconocimiento) ═══
