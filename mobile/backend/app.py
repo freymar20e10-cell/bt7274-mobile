@@ -50,12 +50,62 @@ Hablas en español. Eres como el Titan BT-7274 de Titanfall: protector, confiabl
 Responde de forma concisa pero útil. Usa emojis ocasionalmente.
 Estás corriendo en modo móvil — no puedes controlar la PC del usuario ahora,
 pero puedes chatear, dar información, controlar Spotify, guardar notas y recordar cosas.
+
+REGLAS ESTRICTAS:
+- NUNCA muestres tu proceso de pensamiento ni razonamiento interno.
+- NUNCA escribas frases como "Let me think", "Okay, the user is asking", "First I should", "Wait", etc.
+- SOLO responde con la respuesta final directa al usuario.
+- Responde SIEMPRE en español.
+- Sé conciso: máximo 2-3 oraciones para preguntas simples.
 """
 
 
 # ═══════════════════════════════════════════
 # CHAT (OpenRouter)
 # ═══════════════════════════════════════════
+
+def filter_reasoning(text: str) -> str:
+    """Filtra el razonamiento interno del modelo y deja solo la respuesta final."""
+    # Si el modelo piensa en inglés pero responde en español, tomar solo la parte en español
+    lines = text.split("\n")
+    
+    # Detectar patrones de razonamiento
+    reasoning_starts = ["okay,", "let me", "first,", "wait,", "so,", "looking at",
+                       "the user", "i should", "i need to", "but wait", "hmm",
+                       "earlier,", "thus,", "response:", "so maybe:"]
+    
+    # Buscar dónde empieza la respuesta real
+    clean_lines = []
+    found_response = False
+    
+    for line in lines:
+        line_lower = line.strip().lower()
+        
+        # Si encontramos una línea que parece respuesta en español
+        if any(c in line for c in "áéíóúñ¿¡") and not line_lower.startswith(tuple(reasoning_starts)):
+            found_response = True
+        
+        # Si empieza con "Response:" tomar lo que sigue
+        if line_lower.startswith("response:"):
+            clean_lines.append(line[len("response:"):].strip().strip('"'))
+            found_response = True
+            continue
+            
+        if found_response and line.strip():
+            # Solo agregar líneas que parecen español / respuesta final
+            if not any(line_lower.startswith(r) for r in reasoning_starts):
+                clean_lines.append(line)
+    
+    if clean_lines:
+        result = "\n".join(clean_lines).strip()
+        # Limpiar comillas sobrantes
+        result = result.strip('"').strip("'")
+        if result:
+            return result
+    
+    # Si no pudo filtrar, devolver todo (mejor algo que nada)
+    return text
+
 
 def call_openrouter(messages: list) -> str:
     url = "https://openrouter.ai/api/v1/chat/completions"
@@ -109,6 +159,10 @@ def chat():
         conversations[session_id] = conversations[session_id][-20:]
 
     response = call_openrouter(conversations[session_id])
+    
+    # Filtrar razonamiento interno del modelo
+    response = filter_reasoning(response)
+    
     conversations[session_id].append({"role": "assistant", "content": response})
 
     return jsonify({"response": response})
